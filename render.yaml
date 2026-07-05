@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: secret-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python secret_bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false            # вставишь в дашборде Render
+      - key: SECRET_BOT_PASSWORD
+        sync: false            # придумай сам, запомни
+      - key: UPSTASH_REDIS_REST_URL
+        sync: false
+      - key: UPSTASH_REDIS_REST_TOKEN
+        sync: false
