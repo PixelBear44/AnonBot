@@ -1,4 +1,4 @@
-"""Скрытый бот-тайник. Фраза -> секрет под спойлером. Всё стирается за 30 сек.
+"""Скрытый бот-тайник. Фраза -> секрет под спойлером. Чистится вручную: /clear, /wipe.
 
 Запуск:
     BOT_TOKEN=...  SECRET_BOT_PASSWORD=...  python secret_bot.py
@@ -9,7 +9,7 @@
 
 Формат store: {uid: {"pin": str|None, "items": {phrase: {"s": secret, "once": bool}}}}
 """
-import asyncio, base64, getpass, hashlib, html, json, os, sys, threading
+import base64, getpass, hashlib, html, json, os, sys, threading
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -18,7 +18,6 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
                           ContextTypes, MessageHandler, filters)
 
-TTL = 30                      # секунд до удаления любого сообщения
 DATA_FILE = "secrets.enc"
 REDIS_URL = os.environ.get("UPSTASH_REDIS_REST_URL")
 REDIS_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
@@ -31,7 +30,6 @@ msg_log: dict = {}            # {chat_id: set(message_id)} — для /clear и 
 pending: dict = {}            # {uid: {"step": "phrase"|"secret", "phrase": str, "once": bool}}
 unlocked: dict = {}           # {uid: True} — открыт ли PIN-замок (в памяти, до /lock или рестарта)
 menu_snap: dict = {}          # {uid: [phrase,...]} — снимок для кнопок удаления в /list
-_tasks: set = set()           # ссылки на задачи удаления, чтобы их не съел GC
 
 
 # ---- хранилище (шифрованный blob в Upstash Redis или в файле) ----------
@@ -104,21 +102,9 @@ def _items(uid: str) -> dict:
     return _user(uid)["items"]
 
 
-# ---- автоудаление сообщений --------------------------------------------
-async def _del_later(bot, chat_id, msg_id, delay):
-    await asyncio.sleep(delay)
-    try:
-        await bot.delete_message(chat_id, msg_id)
-    except Exception:
-        pass  # ponytail: чужое/старое (>48ч) сообщение бот удалить не может — игнор
-    msg_log.get(chat_id, set()).discard(msg_id)
-
-
-def ttl_delete(context, chat_id, msg_id, delay=TTL):
+# ---- учёт сообщений (для ручного /clear и /wipe) -----------------------
+def track(chat_id, msg_id):
     msg_log.setdefault(chat_id, set()).add(msg_id)
-    t = asyncio.create_task(_del_later(context.bot, chat_id, msg_id, delay))
-    _tasks.add(t)
-    t.add_done_callback(_tasks.discard)
 
 
 async def clear_messages(context, chat_id, extra_id=None):
@@ -135,7 +121,7 @@ async def clear_messages(context, chat_id, extra_id=None):
 
 async def reply(update, context, text, **kw):
     m = await update.message.reply_text(text, **kw)
-    ttl_delete(context, m.chat_id, m.message_id)
+    track(m.chat_id, m.message_id)
     return m
 
 
@@ -150,7 +136,7 @@ async def _guard(update, context) -> bool:
 
 # ---- команды -----------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ttl_delete(context, update.effective_chat.id, update.message.message_id)
+    track(update.effective_chat.id, update.message.message_id)
     await reply(update, context,
                 "Тайник.\n"
                 "• Спрятать:  /add\n"
@@ -159,12 +145,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "• Мои фразы / удалить:  /list\n"
                 "• PIN-замок:  /pin 1234  (открыть /unlock 1234, закрыть /lock)\n"
                 "• Стереть переписку:  /clear\n"
-                "• Удалить всё:  /wipe\n\n"
-                "Всё исчезает через 30 секунд.")
+                "• Удалить всё:  /wipe")
 
 
 async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ttl_delete(context, update.effective_chat.id, update.message.message_id)
+    track(update.effective_chat.id, update.message.message_id)
     if await _guard(update, context):
         return
     pending[str(update.effective_user.id)] = {"step": "phrase", "once": False}
@@ -172,7 +157,7 @@ async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def once(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ttl_delete(context, update.effective_chat.id, update.message.message_id)
+    track(update.effective_chat.id, update.message.message_id)
     if await _guard(update, context):
         return
     pending[str(update.effective_user.id)] = {"step": "phrase", "once": True}
@@ -180,13 +165,13 @@ async def once(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ttl_delete(context, update.effective_chat.id, update.message.message_id)
+    track(update.effective_chat.id, update.message.message_id)
     pending.pop(str(update.effective_user.id), None)
     await reply(update, context, "Отменено.")
 
 
 async def list_(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ttl_delete(context, update.effective_chat.id, update.message.message_id)
+    track(update.effective_chat.id, update.message.message_id)
     if await _guard(update, context):
         return
     uid = str(update.effective_user.id)
@@ -199,7 +184,7 @@ async def list_(update: Update, context: ContextTypes.DEFAULT_TYPE):
           for i, p in enumerate(phrases)]
     m = await update.message.reply_text("Твои фразы (нажми, чтобы удалить):",
                                         reply_markup=InlineKeyboardMarkup(kb))
-    ttl_delete(context, m.chat_id, m.message_id)
+    track(m.chat_id, m.message_id)
 
 
 async def on_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -225,11 +210,11 @@ async def on_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await q.edit_message_text("Пусто.")
     except Exception:
-        pass  # сообщение уже могло удалиться по TTL
+        pass  # сообщение уже могло быть удалено через /clear
 
 
 async def pin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ttl_delete(context, update.effective_chat.id, update.message.message_id)
+    track(update.effective_chat.id, update.message.message_id)
     uid = str(update.effective_user.id)
     u = _user(uid)
     if not context.args:
@@ -250,11 +235,13 @@ async def pin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u["pin"] = context.args[0]     # ponytail: PIN лежит внутри уже зашифрованного blob; хэш не даёт выигрыша (сервер и так расшифровывает всё мастер-паролем)
     unlocked[uid] = True
     save()
-    await reply(update, context, "PIN установлен. 🔒 Теперь бот открывается через /unlock КОД.")
+    await reply(update, context,
+                "PIN установлен ✅ Сейчас замок открыт.\n"
+                "Закроется по /lock или после перезапуска — тогда открывать: /unlock КОД.")
 
 
 async def unlock(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ttl_delete(context, update.effective_chat.id, update.message.message_id)
+    track(update.effective_chat.id, update.message.message_id)
     uid = str(update.effective_user.id)
     u = _user(uid)
     if not u["pin"]:
@@ -268,7 +255,7 @@ async def unlock(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def lock(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ttl_delete(context, update.effective_chat.id, update.message.message_id)
+    track(update.effective_chat.id, update.message.message_id)
     unlocked.pop(str(update.effective_user.id), None)
     await reply(update, context, "Закрыто. 🔒")
 
@@ -286,7 +273,7 @@ async def wipe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pending.pop(uid, None)
     confirmed = context.args and context.args[0].lower() in ("да", "yes", "y", "да!")
     if not confirmed:
-        ttl_delete(context, update.effective_chat.id, update.message.message_id)
+        track(update.effective_chat.id, update.message.message_id)
         await reply(update, context,
                     "Это удалит ВСЕ твои фразы, без возврата.\nТочно? Напиши:  /wipe да")
         return
@@ -300,7 +287,7 @@ async def wipe(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ttl_delete(context, update.effective_chat.id, update.message.message_id)
+    track(update.effective_chat.id, update.message.message_id)
     uid = str(update.effective_user.id)
     text = update.message.text.strip()
 
