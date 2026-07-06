@@ -5,11 +5,19 @@
 Если переменные не заданы — спросит при старте.
 
 Хранилище: Upstash Redis (если задан UPSTASH_REDIS_REST_URL), иначе локальный
-файл secrets.enc. В обоих случаях данные зашифрованы мастер-паролем.
+файл secrets.enc. Весь store шифруется мастер-паролем перед записью.
 
-Формат store: {uid: {"pin": str|None, "items": {phrase: {"s": secret, "once": bool}}}}
+Код доступа (опционально, на пользователя) ДОПОЛНИТЕЛЬНО шифрует его секреты
+ключом, выведенным из этого кода. Бот код не хранит -> без кода секреты не
+прочитает даже сервер. Забыл код -> секреты потеряны навсегда.
+
+Формат записи (v2):
+    {uid: {"v":2, "code_salt": b64|None, "blob": str|None, "items": {...},
+           "panic": str|None, "fails": int, "lock_until": float}}
+    - есть код:  code_salt+blob заданы, items пустой (секреты внутри blob);
+    - нет кода:  code_salt/blob = None, секреты лежат в items открыто.
 """
-import base64, getpass, hashlib, html, json, os, sys, threading
+import base64, getpass, hashlib, html, json, os, sys, threading, time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -23,19 +31,31 @@ REDIS_URL = os.environ.get("UPSTASH_REDIS_REST_URL")
 REDIS_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
 BLOB_KEY = "secret_bot:blob"
 
-fernet: Fernet = None         # ставится в load()
+UNLOCK_TIMEOUT = 300          # сек бездействия до автозакрытия кода
+MAX_FAILS = 5                 # неверных попыток /unlock до паузы
+LOCKOUT = 60                  # сек паузы после MAX_FAILS
+
+fernet: Fernet = None         # мастер-шифрование store; ставится в load()
 SALT = b""
 store: dict = {}              # см. формат в докстринге
 msg_log: dict = {}            # {chat_id: set(message_id)} — для /clear и /wipe
-pending: dict = {}            # {uid: {"step": "phrase"|"secret", "phrase": str, "once": bool}}
-unlocked: dict = {}           # {uid: True} — открыт ли PIN-замок (в памяти, до /lock или рестарта)
+pending: dict = {}            # {uid: {"step","phrase","once"}} — диалог /add и /once
+sess: dict = {}               # {uid: {"items": {...}, "key": bytes, "last": ts}} — открытая сессия кода
 menu_snap: dict = {}          # {uid: [phrase,...]} — снимок для кнопок удаления в /list
 
 
-# ---- хранилище (шифрованный blob в Upstash Redis или в файле) ----------
-def _key(password: str, salt: bytes) -> bytes:
-    raw = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 200_000, dklen=32)
+# ---- крипто/хранилище --------------------------------------------------
+def _key(code: str, salt: bytes) -> bytes:
+    raw = hashlib.pbkdf2_hmac("sha256", code.encode(), salt, 200_000, dklen=32)
     return base64.urlsafe_b64encode(raw)
+
+
+def _enc(items: dict, key: bytes) -> str:
+    return Fernet(key).encrypt(json.dumps(items).encode()).decode()
+
+
+def _dec(blob: str, key: bytes) -> dict:
+    return json.loads(Fernet(key).decrypt(blob.encode()).decode())
 
 
 def _redis(*cmd):
@@ -59,14 +79,33 @@ def _write_blob(text: str):
         open(DATA_FILE, "w", encoding="utf-8").write(text)
 
 
+def _new_user() -> dict:
+    return {"v": 2, "code_salt": None, "blob": None, "items": {},
+            "panic": None, "fails": 0, "lock_until": 0}
+
+
 def _migrate():
-    # старый формат {phrase: "secret"} -> новый {"pin": None, "items": {...}}
+    # приводим любую старую запись к формату v2
     for uid, u in list(store.items()):
-        if not (isinstance(u, dict) and isinstance(u.get("items"), dict) and "pin" in u):
-            old = u if isinstance(u, dict) else {}
-            store[uid] = {"pin": None,
-                          "items": {p: (s if isinstance(s, dict) else {"s": s, "once": False})
-                                    for p, s in old.items()}}
+        if isinstance(u, dict) and u.get("v") == 2:
+            continue
+        rec = _new_user()
+        old_pin = None
+        if isinstance(u, dict) and isinstance(u.get("items"), dict) and "pin" in u:
+            old_items, old_pin = u["items"], u.get("pin")        # формат v1
+        elif isinstance(u, dict):
+            old_items = u                                        # самый старый {phrase: secret}
+        else:
+            old_items = {}
+        items = {p: (s if isinstance(s, dict) else {"s": s, "once": False})
+                 for p, s in old_items.items()}
+        if old_pin:                                              # старый PIN -> код доступа
+            salt = os.urandom(16)
+            rec["code_salt"] = base64.b64encode(salt).decode()
+            rec["blob"] = _enc(items, _key(old_pin, salt))
+        else:
+            rec["items"] = items
+        store[uid] = rec
 
 
 def load(password: str):
@@ -94,18 +133,47 @@ def save():
     _write_blob(json.dumps({"salt": base64.b64encode(SALT).decode(), "data": token}))
 
 
+# ---- доступ к секретам пользователя ------------------------------------
 def _user(uid: str) -> dict:
-    return store.setdefault(uid, {"pin": None, "items": {}})
+    return store.setdefault(uid, _new_user())
 
 
-def _items(uid: str) -> dict:
-    return _user(uid)["items"]
-
-
-def _pin(uid: str):
-    # чтение без создания пустой записи (в отличие от _user)
+def _has_code(uid: str) -> bool:
     u = store.get(uid)
-    return u["pin"] if u else None
+    return bool(u and u.get("code_salt"))
+
+
+def _is_open(uid: str) -> bool:
+    """Открыт ли доступ. Без кода — всегда. С кодом — если сессия жива (продлевает её)."""
+    if not _has_code(uid):
+        return True
+    s = sess.get(uid)
+    if not s:
+        return False
+    if time.time() - s["last"] > UNLOCK_TIMEOUT:
+        sess.pop(uid, None)
+        return False
+    s["last"] = time.time()
+    return True
+
+
+def _current_items(uid: str) -> dict:
+    # для кода вызывать только когда _is_open(uid) == True
+    return sess[uid]["items"] if _has_code(uid) else _user(uid)["items"]
+
+
+def _save_items(uid: str):
+    if _has_code(uid):
+        s = sess[uid]
+        _user(uid)["blob"] = _enc(s["items"], s["key"])
+    save()
+
+
+def _wipe_user(uid: str):
+    store.pop(uid, None)
+    sess.pop(uid, None)
+    pending.pop(uid, None)
+    menu_snap.pop(uid, None)
 
 
 # ---- учёт сообщений (для ручного /clear и /wipe) -----------------------
@@ -140,10 +208,10 @@ async def reply(update, context, text, **kw):
 
 
 async def _guard(update, context) -> bool:
-    """Заблокировано PIN-ом? Тогда отвечает 🔒 и возвращает True (для явных команд)."""
+    """Закрыто кодом? Отвечает 🔒 и возвращает True (для явных команд)."""
     uid = str(update.effective_user.id)
-    if _pin(uid) and not unlocked.get(uid):
-        await reply(update, context, "🔒 Бот закрыт паролем. Открой: /unlock КОД")
+    if _has_code(uid) and not _is_open(uid):
+        await reply(update, context, "🔒 Бот закрыт кодом. Открой: /unlock КОД")
         return True
     return False
 
@@ -153,16 +221,19 @@ HELP = (
     "🔒 <b>Тайник</b> — прячет секреты за кодовой фразой.\n\n"
     "Придумываешь фразу и прячешь за ней секрет. Потом пишешь эту фразу боту — "
     "он показывает секрет под спойлером (нажать, чтобы увидеть).\n\n"
-    "<b>Команды</b>\n"
+    "<b>Секреты</b>\n"
     "📥 /add — спрятать секрет (спросит фразу, потом секрет)\n"
     "🔥 /once — то же, но секрет сгорит после первого показа\n"
     "🔎 Достать — просто напиши свою фразу\n"
-    "📋 /list — список твоих фраз, удалить лишние\n"
-    "🔑 /pin 1234 — поставить пароль на бота\n"
-    "     /unlock 1234 — открыть · /lock — закрыть\n"
-    "🧹 /clear — стереть всю переписку (фразы остаются)\n"
-    "💣 /wipe — удалить вообще всё (фразы + переписку)\n\n"
-    "⚠️ Само ничего не удаляется — чисти через /clear или /wipe."
+    "📋 /list — список фраз, удалить лишние\n\n"
+    "<b>Защита (по желанию)</b>\n"
+    "🔑 /code МОЙКОД — зашифровать секреты кодом (сервер их не прочитает)\n"
+    "🔓 /unlock МОЙКОД — открыть · 🔒 /lock — закрыть\n"
+    "🆘 /panic КОД — код-ловушка: введёшь его в /unlock — всё сотрётся\n\n"
+    "<b>Уборка</b>\n"
+    "🧹 /clear — стереть переписку (секреты остаются)\n"
+    "💣 /wipe — удалить вообще всё\n\n"
+    "⚠️ Само ничего не удаляется. Забудешь код — секреты не вернуть."
 )
 
 
@@ -195,7 +266,7 @@ LIST_HEADER = "📋 Твои фразы. Нажми на любую, чтобы 
 
 
 def _list_kb(uid):
-    items = _items(uid)
+    items = _current_items(uid)
     return [[InlineKeyboardButton(("🔥 " if items[p].get("once") else "") + f"❌ {p}",
                                   callback_data=f"del:{i}")]
             for i, p in enumerate(items)]
@@ -205,10 +276,10 @@ async def list_(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await _guard(update, context):
         return
     uid = str(update.effective_user.id)
-    if not _items(uid):
+    if not _current_items(uid):
         await reply(update, context, "Пусто. Спрячь первый секрет: /add")
         return
-    menu_snap[uid] = list(_items(uid).keys())
+    menu_snap[uid] = list(_current_items(uid).keys())
     m = await update.message.reply_text(LIST_HEADER,
                                         reply_markup=InlineKeyboardMarkup(_list_kb(uid)))
     track(m.chat_id, m.message_id)
@@ -217,20 +288,20 @@ async def list_(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     uid = str(q.from_user.id)
-    if _pin(uid) and not unlocked.get(uid):
+    if _has_code(uid) and not _is_open(uid):
         await q.answer("🔒 Открой через /unlock", show_alert=True)
         return
     i = int(q.data.split(":")[1])
     snap = menu_snap.get(uid, [])
     if 0 <= i < len(snap):
-        _items(uid).pop(snap[i], None)
-        save()
+        _current_items(uid).pop(snap[i], None)
+        _save_items(uid)
         await q.answer("Удалено")
     else:
         await q.answer()
-    menu_snap[uid] = list(_items(uid).keys())
+    menu_snap[uid] = list(_current_items(uid).keys())
     try:
-        if _items(uid):
+        if _current_items(uid):
             await q.edit_message_text(LIST_HEADER,
                                       reply_markup=InlineKeyboardMarkup(_list_kb(uid)))
         else:
@@ -239,53 +310,121 @@ async def on_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass  # сообщение уже могло быть удалено через /clear
 
 
-async def pin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
     u = _user(uid)
     if not context.args:
         await reply(update, context,
-                    "🔑 Пароль на бота.\n"
-                    "Поставить или сменить:  /pin 1234\n"
-                    "Снять:  /pin off\n"
-                    "Открыть:  /unlock 1234  ·  Закрыть:  /lock")
+                    "🔑 Код доступа шифрует твои секреты — без него их не прочитает даже сервер.\n"
+                    "Поставить или сменить:  /code МОЙКОД\n"
+                    "Снять:  /code off\n"
+                    "Открыть:  /unlock МОЙКОД  ·  Закрыть:  /lock\n"
+                    "⚠️ Забудешь код — секреты не вернуть.")
         return
-    # смена/снятие требует, чтобы замок уже был открыт
-    if u["pin"] and not unlocked.get(uid):
-        await reply(update, context, "Сначала открой старым кодом:  /unlock СТАРЫЙ_КОД")
+    if _has_code(uid) and not _is_open(uid):
+        await reply(update, context, "Сначала открой старым кодом:  /unlock КОД")
         return
     if context.args[0].lower() == "off":
-        u["pin"] = None
-        unlocked.pop(uid, None)
+        if not _has_code(uid):
+            await reply(update, context, "Код не установлен.")
+            return
+        u["items"] = dict(sess[uid]["items"])       # возвращаем секреты в открытый вид
+        u["code_salt"] = None
+        u["blob"] = None
+        sess.pop(uid, None)
         save()
-        await reply(update, context, "Пароль снят 🔓 Бот снова открыт.")
+        await reply(update, context, "Код снят 🔓 Секреты больше не зашифрованы личным кодом.")
         return
-    u["pin"] = context.args[0]     # ponytail: PIN лежит внутри уже зашифрованного blob; хэш не даёт выигрыша (сервер и так расшифровывает всё мастер-паролем)
-    unlocked[uid] = True
+    new_code = context.args[0]
+    items = dict(sess[uid]["items"]) if _has_code(uid) else dict(u["items"])
+    salt = os.urandom(16)
+    key = _key(new_code, salt)
+    u["code_salt"] = base64.b64encode(salt).decode()
+    u["blob"] = _enc(items, key)
+    u["items"] = {}
+    u["fails"] = 0
+    u["lock_until"] = 0
+    sess[uid] = {"items": items, "key": key, "last": time.time()}
     save()
     await reply(update, context,
-                "Пароль установлен ✅ Сейчас бот открыт.\n"
-                "Он закроется после /lock или перезапуска — тогда открывай командой /unlock КОД.")
+                "Код установлен ✅ Секреты зашифрованы — сервер их не прочитает.\n"
+                "Сейчас открыто; закроется после /lock или бездействия.\n"
+                "⚠️ Забудешь код — секреты потеряны навсегда.")
 
 
 async def unlock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
-    if not _pin(uid):
-        await reply(update, context, "Пароль не установлен. Поставить:  /pin 1234")
+    u = _user(uid)
+    if not _has_code(uid):
+        await reply(update, context, "Код не установлен. Поставить:  /code 1234")
         return
-    if context.args and context.args[0] == _pin(uid):
-        unlocked[uid] = True
-        await reply(update, context, "Открыто 🔓")
-    else:
-        await reply(update, context, "Неверный код.")
+    now = time.time()
+    if u.get("lock_until", 0) > now:
+        await reply(update, context, f"Слишком много попыток. Подожди {int(u['lock_until'] - now)} сек.")
+        return
+    guess = context.args[0] if context.args else ""
+    if u.get("panic") and guess == u["panic"]:               # паник-код: молча стираем всё
+        _wipe_user(uid)
+        await clear_messages(context, update.effective_chat.id)
+        await context.bot.send_message(update.effective_chat.id, "Открыто 🔓")
+        return
+    try:
+        items = _dec(u["blob"], _key(guess, base64.b64decode(u["code_salt"])))
+    except InvalidToken:
+        u["fails"] = u.get("fails", 0) + 1
+        if u["fails"] >= MAX_FAILS:
+            u["lock_until"] = now + LOCKOUT
+            u["fails"] = 0
+            save()
+            await reply(update, context, f"Неверный код. Пауза {LOCKOUT} сек.")
+        else:
+            save()
+            await reply(update, context, f"Неверный код. Осталось попыток: {MAX_FAILS - u['fails']}")
+        return
+    sess[uid] = {"items": items, "key": _key(guess, base64.b64decode(u["code_salt"])), "last": now}
+    u["fails"] = 0
+    u["lock_until"] = 0
+    save()
+    await reply(update, context, "Открыто 🔓")
 
 
 async def lock(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    unlocked.pop(str(update.effective_user.id), None)
+    sess.pop(str(update.effective_user.id), None)
     await reply(update, context, "Закрыто 🔒 Секреты скрыты. Открыть: /unlock КОД")
 
 
+async def panic(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    u = _user(uid)
+    if not context.args:
+        await reply(update, context,
+                    "🆘 Паник-код — ловушка. Введёшь его в /unlock — все секреты и переписка "
+                    "молча сотрутся.\nПоставить:  /panic 0000  ·  Убрать:  /panic off")
+        return
+    if _has_code(uid) and not _is_open(uid):
+        await reply(update, context, "Сначала открой: /unlock КОД")
+        return
+    if context.args[0].lower() == "off":
+        u["panic"] = None
+        save()
+        await reply(update, context, "Паник-код убран.")
+        return
+    cand = context.args[0]
+    if _has_code(uid):                       # паник не должен совпадать с настоящим кодом
+        try:
+            _dec(u["blob"], _key(cand, base64.b64decode(u["code_salt"])))
+            await reply(update, context, "Паник-код должен отличаться от основного кода.")
+            return
+        except InvalidToken:
+            pass
+    u["panic"] = cand
+    save()
+    await reply(update, context,
+                "Паник-код установлен. Введёшь его в /unlock — всё сотрётся без предупреждения.")
+
+
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # только сообщения; фразы остаются. Молча — бот ничего после себя не оставляет.
+    # только сообщения; секреты остаются. Молча — бот ничего после себя не оставляет.
     pending.pop(str(update.effective_user.id), None)
     await clear_messages(context, update.effective_chat.id, update.message.message_id)
 
@@ -301,8 +440,7 @@ async def wipe(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "💣 Удалит ВСЕ твои фразы и всю переписку. Вернуть будет нельзя.\n"
                     "Точно? Напиши:  /wipe да")
         return
-    store.pop(uid, None)
-    unlocked.pop(uid, None)
+    _wipe_user(uid)
     try:
         save()
     except Exception:
@@ -324,11 +462,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             phrase = st["phrase"].casefold()
             once_flag = st["once"]
             pending.pop(uid, None)
-            _items(uid)[phrase] = {"s": text, "once": once_flag}
+            if _has_code(uid) and not _is_open(uid):        # код закрылся посреди диалога
+                await reply(update, context, "🔒 Бот закрылся. Открой /unlock и начни заново: /add")
+                return
+            _current_items(uid)[phrase] = {"s": text, "once": once_flag}
             try:
-                save()
+                _save_items(uid)
             except Exception:
-                _items(uid).pop(phrase, None)   # откат, чтобы память не разошлась с хранилищем
+                _current_items(uid).pop(phrase, None)   # откат, чтобы память не разошлась с хранилищем
                 await reply(update, context, "⚠️ Не сохранилось — попробуй ещё раз: /add")
                 return
             await reply(update, context,
@@ -338,16 +479,17 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # обычный запрос фразы
-    if _pin(uid) and not unlocked.get(uid):
+    if _has_code(uid) and not _is_open(uid):
         return                                # под замком — молчим (скрытность)
-    entry = _items(uid).get(text.casefold())
+    items = _current_items(uid)
+    entry = items.get(text.casefold())
     if entry:
         secret = entry["s"] if isinstance(entry, dict) else entry
         await reply(update, context,
                     f"<tg-spoiler>{html.escape(secret)}</tg-spoiler>", parse_mode="HTML")
         if isinstance(entry, dict) and entry.get("once"):
-            _items(uid).pop(text.casefold(), None)   # сгорело
-            save()
+            items.pop(text.casefold(), None)   # сгорело
+            _save_items(uid)
     # неизвестная фраза -> молчим (полная скрытность)
 
 
@@ -367,9 +509,10 @@ async def _post_init(app):
         ("add", "📥 спрятать секрет"),
         ("once", "🔥 секрет на один показ"),
         ("list", "📋 мои фразы (удалить)"),
-        ("unlock", "🔓 открыть бота паролем"),
-        ("lock", "🔒 закрыть бота"),
-        ("pin", "🔑 поставить/сменить пароль"),
+        ("code", "🔑 зашифровать кодом"),
+        ("unlock", "🔓 открыть"),
+        ("lock", "🔒 закрыть"),
+        ("panic", "🆘 паник-код"),
         ("clear", "🧹 стереть переписку"),
         ("wipe", "💣 удалить всё"),
         ("help", "❓ помощь"),
@@ -388,9 +531,11 @@ def main():
     app.add_handler(CommandHandler("add", add))
     app.add_handler(CommandHandler("once", once))
     app.add_handler(CommandHandler("list", list_))
-    app.add_handler(CommandHandler("pin", pin))
+    app.add_handler(CommandHandler("code", code))
+    app.add_handler(CommandHandler("pin", code))       # алиас для привычки
     app.add_handler(CommandHandler("unlock", unlock))
     app.add_handler(CommandHandler("lock", lock))
+    app.add_handler(CommandHandler("panic", panic))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("clear", clear))
     app.add_handler(CommandHandler("wipe", wipe))
