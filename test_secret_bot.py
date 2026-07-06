@@ -1,8 +1,8 @@
-"""Проверка денежного/секретного пути: шифрование переживает round-trip,
-чужой пароль — не расшифровывает. Запуск: python test_secret_bot.py"""
+"""Проверки: шифрование (round-trip + чужой пароль) и миграция старого формата.
+Запуск: python test_secret_bot.py"""
 import json
 from cryptography.fernet import Fernet, InvalidToken
-from secret_bot import _key
+from secret_bot import _key, store, _migrate
 
 
 def test_roundtrip_and_wrong_password():
@@ -19,6 +19,19 @@ def test_roundtrip_and_wrong_password():
         pass
 
 
+def test_migrate_old_to_new():
+    store.clear()
+    store["7"] = {"фраза": "секрет"}                 # старый формат
+    _migrate()
+    u = store["7"]
+    assert u["pin"] is None
+    assert u["items"]["фраза"] == {"s": "секрет", "once": False}
+    _migrate()                                        # повторно — не ломается
+    assert store["7"]["items"]["фраза"]["s"] == "секрет"
+    store.clear()
+
+
 if __name__ == "__main__":
     test_roundtrip_and_wrong_password()
+    test_migrate_old_to_new()
     print("ok")
