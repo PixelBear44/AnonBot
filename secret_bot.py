@@ -335,7 +335,7 @@ async def code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save()
         await reply(update, context, "Код снят 🔓 Секреты больше не зашифрованы личным кодом.")
         return
-    new_code = context.args[0]
+    new_code = " ".join(context.args)          # весь ввод, а не только первое слово
     items = dict(sess[uid]["items"]) if _has_code(uid) else dict(u["items"])
     salt = os.urandom(16)
     key = _key(new_code, salt)
@@ -358,18 +358,20 @@ async def unlock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _has_code(uid):
         await reply(update, context, "Код не установлен. Поставить:  /code 1234")
         return
-    now = time.time()
-    if u.get("lock_until", 0) > now:
-        await reply(update, context, f"Слишком много попыток. Подожди {int(u['lock_until'] - now)} сек.")
-        return
-    guess = context.args[0] if context.args else ""
-    if u.get("panic") and guess == u["panic"]:               # паник-код: молча стираем всё
+    guess = " ".join(context.args)             # весь ввод, а не только первое слово
+    # паник-код проверяем ПЕРВЫМ — он должен сработать даже во время паузы за перебор
+    if u.get("panic") and guess == u["panic"]:               # молча стираем всё
         _wipe_user(uid)
         await clear_messages(context, update.effective_chat.id)
         await context.bot.send_message(update.effective_chat.id, "Открыто 🔓")
         return
+    now = time.time()
+    if u.get("lock_until", 0) > now:
+        await reply(update, context, f"Слишком много попыток. Подожди {int(u['lock_until'] - now)} сек.")
+        return
+    key = _key(guess, base64.b64decode(u["code_salt"]))       # считаем KDF один раз
     try:
-        items = _dec(u["blob"], _key(guess, base64.b64decode(u["code_salt"])))
+        items = _dec(u["blob"], key)
     except InvalidToken:
         u["fails"] = u.get("fails", 0) + 1
         if u["fails"] >= MAX_FAILS:
@@ -381,7 +383,7 @@ async def unlock(update: Update, context: ContextTypes.DEFAULT_TYPE):
             save()
             await reply(update, context, f"Неверный код. Осталось попыток: {MAX_FAILS - u['fails']}")
         return
-    sess[uid] = {"items": items, "key": _key(guess, base64.b64decode(u["code_salt"])), "last": now}
+    sess[uid] = {"items": items, "key": key, "last": now}
     u["fails"] = 0
     u["lock_until"] = 0
     save()
@@ -409,7 +411,11 @@ async def panic(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save()
         await reply(update, context, "Паник-код убран.")
         return
-    cand = context.args[0]
+    if not _has_code(uid):                   # без основного кода паник-код никогда не сработает
+        await reply(update, context,
+                    "Паник-код работает только вместе с /code. Сначала поставь код: /code МОЙКОД")
+        return
+    cand = " ".join(context.args)            # весь ввод, а не только первое слово
     if _has_code(uid):                       # паник не должен совпадать с настоящим кодом
         try:
             _dec(u["blob"], _key(cand, base64.b64decode(u["code_salt"])))
@@ -430,8 +436,8 @@ async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def wipe(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await _guard(update, context):     # под замком стереть всё нельзя
-        return
+    # намеренно БЕЗ замка: wipe только уничтожает (не раскрывает), и это путь сброса,
+    # если код забыт. Подтверждение /wipe да остаётся.
     uid = str(update.effective_user.id)
     pending.pop(uid, None)
     confirmed = context.args and context.args[0].lower() in ("да", "yes", "y", "да!")
