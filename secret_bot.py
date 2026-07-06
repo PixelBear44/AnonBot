@@ -102,9 +102,23 @@ def _items(uid: str) -> dict:
     return _user(uid)["items"]
 
 
+def _pin(uid: str):
+    # чтение без создания пустой записи (в отличие от _user)
+    u = store.get(uid)
+    return u["pin"] if u else None
+
+
 # ---- учёт сообщений (для ручного /clear и /wipe) -----------------------
 def track(chat_id, msg_id):
     msg_log.setdefault(chat_id, set()).add(msg_id)
+
+
+async def track_incoming(update, context):
+    # group=-1: запоминаем ЛЮБОЕ входящее сообщение (текст, команды, фото, стикеры),
+    # чтобы /clear и /wipe могли его удалить.
+    m = update.effective_message
+    if m:
+        track(m.chat_id, m.message_id)
 
 
 async def clear_messages(context, chat_id, extra_id=None):
@@ -128,136 +142,146 @@ async def reply(update, context, text, **kw):
 async def _guard(update, context) -> bool:
     """Заблокировано PIN-ом? Тогда отвечает 🔒 и возвращает True (для явных команд)."""
     uid = str(update.effective_user.id)
-    if _user(uid)["pin"] and not unlocked.get(uid):
-        await reply(update, context, "🔒 Заблокировано. Открой: /unlock КОД")
+    if _pin(uid) and not unlocked.get(uid):
+        await reply(update, context, "🔒 Бот закрыт паролем. Открой: /unlock КОД")
         return True
     return False
 
 
 # ---- команды -----------------------------------------------------------
+HELP = (
+    "🔒 <b>Тайник</b> — прячет секреты за кодовой фразой.\n\n"
+    "Придумываешь фразу и прячешь за ней секрет. Потом пишешь эту фразу боту — "
+    "он показывает секрет под спойлером (нажать, чтобы увидеть).\n\n"
+    "<b>Команды</b>\n"
+    "📥 /add — спрятать секрет (спросит фразу, потом секрет)\n"
+    "🔥 /once — то же, но секрет сгорит после первого показа\n"
+    "🔎 Достать — просто напиши свою фразу\n"
+    "📋 /list — список твоих фраз, удалить лишние\n"
+    "🔑 /pin 1234 — поставить пароль на бота\n"
+    "     /unlock 1234 — открыть · /lock — закрыть\n"
+    "🧹 /clear — стереть всю переписку (фразы остаются)\n"
+    "💣 /wipe — удалить вообще всё (фразы + переписку)\n\n"
+    "⚠️ Само ничего не удаляется — чисти через /clear или /wipe."
+)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    track(update.effective_chat.id, update.message.message_id)
-    await reply(update, context,
-                "Тайник.\n"
-                "• Спрятать:  /add\n"
-                "• Секрет на один раз:  /once\n"
-                "• Достать:  просто напиши свою фразу\n"
-                "• Мои фразы / удалить:  /list\n"
-                "• PIN-замок:  /pin 1234  (открыть /unlock 1234, закрыть /lock)\n"
-                "• Стереть переписку:  /clear\n"
-                "• Удалить всё:  /wipe")
+    await reply(update, context, HELP, parse_mode="HTML")
 
 
 async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    track(update.effective_chat.id, update.message.message_id)
     if await _guard(update, context):
         return
     pending[str(update.effective_user.id)] = {"step": "phrase", "once": False}
-    await reply(update, context, "Пришли кодовую фразу одним сообщением:")
+    await reply(update, context, "Шаг 1 из 2.\nПришли кодовую фразу — по ней потом достанешь секрет:")
 
 
 async def once(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    track(update.effective_chat.id, update.message.message_id)
     if await _guard(update, context):
         return
     pending[str(update.effective_user.id)] = {"step": "phrase", "once": True}
-    await reply(update, context, "Секрет сгорит после первого показа.\nПришли кодовую фразу:")
+    await reply(update, context,
+                "🔥 Секрет сгорит сразу после первого показа.\n"
+                "Шаг 1 из 2.\nПришли кодовую фразу:")
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    track(update.effective_chat.id, update.message.message_id)
     pending.pop(str(update.effective_user.id), None)
     await reply(update, context, "Отменено.")
 
 
+LIST_HEADER = "📋 Твои фразы. Нажми на любую, чтобы удалить.\n(🔥 — сгорит после первого показа)"
+
+
+def _list_kb(uid):
+    items = _items(uid)
+    return [[InlineKeyboardButton(("🔥 " if items[p].get("once") else "") + f"❌ {p}",
+                                  callback_data=f"del:{i}")]
+            for i, p in enumerate(items)]
+
+
 async def list_(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    track(update.effective_chat.id, update.message.message_id)
     if await _guard(update, context):
         return
     uid = str(update.effective_user.id)
-    phrases = list(_items(uid).keys())
-    if not phrases:
-        await reply(update, context, "Пусто.")
+    if not _items(uid):
+        await reply(update, context, "Пусто. Спрячь первый секрет: /add")
         return
-    menu_snap[uid] = phrases
-    kb = [[InlineKeyboardButton(f"❌ {p}", callback_data=f"del:{i}")]
-          for i, p in enumerate(phrases)]
-    m = await update.message.reply_text("Твои фразы (нажми, чтобы удалить):",
-                                        reply_markup=InlineKeyboardMarkup(kb))
+    menu_snap[uid] = list(_items(uid).keys())
+    m = await update.message.reply_text(LIST_HEADER,
+                                        reply_markup=InlineKeyboardMarkup(_list_kb(uid)))
     track(m.chat_id, m.message_id)
 
 
 async def on_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     uid = str(q.from_user.id)
-    if _user(uid)["pin"] and not unlocked.get(uid):
+    if _pin(uid) and not unlocked.get(uid):
         await q.answer("🔒 Открой через /unlock", show_alert=True)
         return
-    await q.answer()
     i = int(q.data.split(":")[1])
     snap = menu_snap.get(uid, [])
     if 0 <= i < len(snap):
         _items(uid).pop(snap[i], None)
         save()
-    phrases = list(_items(uid).keys())
-    menu_snap[uid] = phrases
+        await q.answer("Удалено")
+    else:
+        await q.answer()
+    menu_snap[uid] = list(_items(uid).keys())
     try:
-        if phrases:
-            kb = [[InlineKeyboardButton(f"❌ {p}", callback_data=f"del:{j}")]
-                  for j, p in enumerate(phrases)]
-            await q.edit_message_text("Твои фразы (нажми, чтобы удалить):",
-                                      reply_markup=InlineKeyboardMarkup(kb))
+        if _items(uid):
+            await q.edit_message_text(LIST_HEADER,
+                                      reply_markup=InlineKeyboardMarkup(_list_kb(uid)))
         else:
-            await q.edit_message_text("Пусто.")
+            await q.edit_message_text("Пусто. Спрячь секрет: /add")
     except Exception:
         pass  # сообщение уже могло быть удалено через /clear
 
 
 async def pin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    track(update.effective_chat.id, update.message.message_id)
     uid = str(update.effective_user.id)
     u = _user(uid)
     if not context.args:
         await reply(update, context,
-                    "PIN: /pin 1234 — поставить/сменить, /pin off — снять.\n"
-                    "Открыть: /unlock 1234,  закрыть: /lock")
+                    "🔑 Пароль на бота.\n"
+                    "Поставить или сменить:  /pin 1234\n"
+                    "Снять:  /pin off\n"
+                    "Открыть:  /unlock 1234  ·  Закрыть:  /lock")
         return
     # смена/снятие требует, чтобы замок уже был открыт
     if u["pin"] and not unlocked.get(uid):
-        await reply(update, context, "Сначала /unlock старым кодом.")
+        await reply(update, context, "Сначала открой старым кодом:  /unlock СТАРЫЙ_КОД")
         return
     if context.args[0].lower() == "off":
         u["pin"] = None
         unlocked.pop(uid, None)
         save()
-        await reply(update, context, "PIN снят.")
+        await reply(update, context, "Пароль снят 🔓 Бот снова открыт.")
         return
     u["pin"] = context.args[0]     # ponytail: PIN лежит внутри уже зашифрованного blob; хэш не даёт выигрыша (сервер и так расшифровывает всё мастер-паролем)
     unlocked[uid] = True
     save()
     await reply(update, context,
-                "PIN установлен ✅ Сейчас замок открыт.\n"
-                "Закроется по /lock или после перезапуска — тогда открывать: /unlock КОД.")
+                "Пароль установлен ✅ Сейчас бот открыт.\n"
+                "Он закроется после /lock или перезапуска — тогда открывай командой /unlock КОД.")
 
 
 async def unlock(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    track(update.effective_chat.id, update.message.message_id)
     uid = str(update.effective_user.id)
-    u = _user(uid)
-    if not u["pin"]:
-        await reply(update, context, "PIN не установлен.")
+    if not _pin(uid):
+        await reply(update, context, "Пароль не установлен. Поставить:  /pin 1234")
         return
-    if context.args and context.args[0] == u["pin"]:
+    if context.args and context.args[0] == _pin(uid):
         unlocked[uid] = True
-        await reply(update, context, "Открыто. 🔓")
+        await reply(update, context, "Открыто 🔓")
     else:
         await reply(update, context, "Неверный код.")
 
 
 async def lock(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    track(update.effective_chat.id, update.message.message_id)
     unlocked.pop(str(update.effective_user.id), None)
-    await reply(update, context, "Закрыто. 🔒")
+    await reply(update, context, "Закрыто 🔒 Секреты скрыты. Открыть: /unlock КОД")
 
 
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -273,9 +297,9 @@ async def wipe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pending.pop(uid, None)
     confirmed = context.args and context.args[0].lower() in ("да", "yes", "y", "да!")
     if not confirmed:
-        track(update.effective_chat.id, update.message.message_id)
         await reply(update, context,
-                    "Это удалит ВСЕ твои фразы, без возврата.\nТочно? Напиши:  /wipe да")
+                    "💣 Удалит ВСЕ твои фразы и всю переписку. Вернуть будет нельзя.\n"
+                    "Точно? Напиши:  /wipe да")
         return
     store.pop(uid, None)
     unlocked.pop(uid, None)
@@ -287,7 +311,6 @@ async def wipe(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    track(update.effective_chat.id, update.message.message_id)
     uid = str(update.effective_user.id)
     text = update.message.text.strip()
 
@@ -296,7 +319,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if st["step"] == "phrase":
             st["phrase"] = text
             st["step"] = "secret"
-            await reply(update, context, "Теперь пришли секрет одним сообщением:")
+            await reply(update, context, "Шаг 2 из 2.\nТеперь пришли сам секрет:")
         else:
             phrase = st["phrase"].casefold()
             once_flag = st["once"]
@@ -306,13 +329,16 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 save()
             except Exception:
                 _items(uid).pop(phrase, None)   # откат, чтобы память не разошлась с хранилищем
-                await reply(update, context, "Не сохранилось — попробуй ещё раз (/add).")
+                await reply(update, context, "⚠️ Не сохранилось — попробуй ещё раз: /add")
                 return
-            await reply(update, context, "Сохранено. 🔥✅" if once_flag else "Сохранено. ✅")
+            await reply(update, context,
+                        "Готово 🔥 Секрет спрятан и сгорит после первого показа."
+                        if once_flag else
+                        "Готово ✅ Секрет спрятан. Напиши свою фразу, чтобы достать его.")
         return
 
     # обычный запрос фразы
-    if _user(uid)["pin"] and not unlocked.get(uid):
+    if _pin(uid) and not unlocked.get(uid):
         return                                # под замком — молчим (скрытность)
     entry = _items(uid).get(text.casefold())
     if entry:
@@ -338,15 +364,15 @@ def _serve_health():
 
 async def _post_init(app):
     await app.bot.set_my_commands([
-        ("add", "спрятать секрет"),
-        ("once", "секрет, сгорающий после прочтения"),
-        ("list", "мои фразы / удалить"),
-        ("unlock", "открыть (PIN)"),
-        ("lock", "закрыть"),
-        ("pin", "поставить/сменить PIN"),
-        ("clear", "стереть переписку"),
-        ("wipe", "удалить всё"),
-        ("cancel", "отмена"),
+        ("add", "📥 спрятать секрет"),
+        ("once", "🔥 секрет на один показ"),
+        ("list", "📋 мои фразы (удалить)"),
+        ("unlock", "🔓 открыть бота паролем"),
+        ("lock", "🔒 закрыть бота"),
+        ("pin", "🔑 поставить/сменить пароль"),
+        ("clear", "🧹 стереть переписку"),
+        ("wipe", "💣 удалить всё"),
+        ("help", "❓ помощь"),
     ])
 
 
@@ -356,7 +382,9 @@ def main():
     load(password)
     threading.Thread(target=_serve_health, daemon=True).start()
     app = Application.builder().token(token).post_init(_post_init).build()
+    app.add_handler(MessageHandler(filters.ALL, track_incoming), group=-1)  # учёт всех сообщений
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", start))
     app.add_handler(CommandHandler("add", add))
     app.add_handler(CommandHandler("once", once))
     app.add_handler(CommandHandler("list", list_))
