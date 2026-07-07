@@ -108,7 +108,7 @@ python test_secret_bot.py
 - [Upstash Redis](https://upstash.com/) — хранилище (зашифрованный blob)
 - [Render](https://render.com/) — бесплатный хостинг
 
-Один файл — [`secret_bot.py`](secret_bot.py), ~330 строк.
+Один файл — [`secret_bot.py`](secret_bot.py), ~460 строк.
 
 ## 📄 Лицензия
 
