@@ -9,6 +9,8 @@
 ![python-telegram-bot](https://img.shields.io/badge/python--telegram--bot-21%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
+🌐 **Русский** · [English](README.en.md)
+
 </div>
 
 ---
