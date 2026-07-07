@@ -15,6 +15,12 @@ Nothing extra, everything is cleared manually, and secrets can be encrypted with
 
 ---
 
+## 🤖 Try it
+
+👉 **[@AnonnnuBot](https://t.me/AnonnnuBot)** — open it in Telegram and use it right away, nothing to install. *(the bot's interface is in Russian)*
+
+> Using this (someone else's) bot means trusting your secrets to its operator — see [Security](#-security--privacy). Want full privacy — set a `/code` or [host your own](DEPLOY.md).
+
 ## What it is
 
 A tiny Telegram bot that stores your secrets behind code phrases.
